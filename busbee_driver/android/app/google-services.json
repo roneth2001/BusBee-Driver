@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "648897886498",
+    "firebase_url": "https://busbee-c492e-default-rtdb.firebaseio.com",
+    "project_id": "busbee-c492e",
+    "storage_bucket": "busbee-c492e.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:648897886498:android:4e54f1aced3671d33bcd7b",
+        "android_client_info": {
+          "package_name": "com.example.busbee_passenger"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD53DiDjI7vXYmxjRwEm7LdtUlxODBkFhU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
