@@ -1,7 +1,6 @@
 import 'package:busbee_driver/screens/driverDashboard.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
-import 'package:firebase_core/firebase_core.dart';
 
 class DriverLoginScreen extends StatefulWidget {
   const DriverLoginScreen({Key? key}) : super(key: key);
