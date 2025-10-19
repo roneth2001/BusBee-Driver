@@ -106,7 +106,7 @@ class _BusDriverLoginScreenState extends State<BusDriverLoginScreen> {
         // Navigate to dashboard
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
-            builder: (context) => BusDriverDashboard(busData: busData),
+            builder: (context) => DriverDashboard(busData: busData),
           ),
         );
       } else {
@@ -185,7 +185,7 @@ class _BusDriverLoginScreenState extends State<BusDriverLoginScreen> {
                               width: 100,
                               height: 100,
                               decoration: BoxDecoration(
-                                color: Colors.blue[600],
+                                color: const Color.fromARGB(255, 255, 0, 0),
                                 borderRadius: BorderRadius.circular(50),
                               ),
                               child: const Icon(
@@ -296,7 +296,7 @@ class _BusDriverLoginScreenState extends State<BusDriverLoginScreen> {
                         child: ElevatedButton(
                           onPressed: _isLoading ? null : _loginDriver,
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.blue[600],
+                            backgroundColor: const Color.fromARGB(255, 255, 0, 0),
                             foregroundColor: Colors.white,
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(12),
@@ -439,7 +439,7 @@ class _BusDriverLoginScreenState extends State<BusDriverLoginScreen> {
                   Text(
                     'Powered by ',
                     style: TextStyle(
-                      fontSize: 14,
+                      fontSize: 10,
                       color: Colors.grey[600],
                       fontWeight: FontWeight.w400,
                     ),
@@ -447,9 +447,9 @@ class _BusDriverLoginScreenState extends State<BusDriverLoginScreen> {
                   GestureDetector(
                     onTap: _launchWebsite,
                     child: Text(
-                      'GW Technology',
+                      'GW Technology (PVT) LTD',
                       style: TextStyle(
-                        fontSize: 14,
+                        fontSize: 10,
                         color: Colors.blue[600],
                         fontWeight: FontWeight.bold,
                         decoration: TextDecoration.underline,

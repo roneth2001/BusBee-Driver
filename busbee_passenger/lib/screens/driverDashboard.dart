@@ -1,289 +1,423 @@
-import 'package:busbee_passenger/screens/loginscreen.dart';
+// lib/screens/driver_dashboard.dart
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
-class BusDriverDashboard extends StatefulWidget {
+import 'loginscreen.dart';
+
+class DriverDashboard extends StatefulWidget {
   final Map<String, dynamic> busData;
-  
-  const BusDriverDashboard({Key? key, required this.busData}) : super(key: key);
+  const DriverDashboard({super.key, required this.busData});
 
   @override
-  State<BusDriverDashboard> createState() => _BusDriverDashboardState();
+  State<DriverDashboard> createState() => _DriverDashboardState();
 }
 
-class _BusDriverDashboardState extends State<BusDriverDashboard> {
-  late DatabaseReference _databaseRef;
+class _DriverDashboardState extends State<DriverDashboard> {
+  late final DatabaseReference _db;
+  late final String _busId;
+
   bool _isUpdatingLocation = false;
   bool _isEndingTour = false;
-  String _currentLocation = '';
-  String _message = '';
-  bool _isSuccess = false;
+  bool _autoUpdateEnabled = true;
+
+  String _currentLocation = 'Unknown';
+  String _lastUpdateClock = '';
+  String _toastMsg = '';
+  bool _toastSuccess = false;
+
+  Timer? _pollTimer;
+  Timer? _kickoffTimer;
+
+  // Live status from DB
+  bool _online = false;
+  int? _lastServerTs;
+  StreamSubscription<DatabaseEvent>? _busSub;
 
   @override
   void initState() {
     super.initState();
-    _databaseRef = FirebaseDatabase.instance.ref();
-    _currentLocation = widget.busData['currentLocation'] ?? 'Unknown';
-    
-    // Set bus as online when dashboard opens
-    _setBusOnlineStatus(true);
+
+    final idRaw = widget.busData['id'];
+    if (idRaw == null || idRaw.toString().trim().isEmpty) {
+      throw FlutterError('DriverDashboard: busData["id"] is required.');
+    }
+    _busId = idRaw.toString().trim();
+
+    _db = FirebaseDatabase.instance.ref();
+
+    _currentLocation = (widget.busData['currentLocation'] ?? 'Unknown').toString();
+
+    // Keep screen awake while on this page
+    WakelockPlus.enable();
+
+    // Mark online
+    _setOnline(true);
+
+    // Listen to this bus node for live badges
+    _listenToBusNode();
+
+    // Start auto updates
+    _startAutoUpdates();
   }
 
-  Future<void> _setBusOnlineStatus(bool isOnline) async {
-    try {
-      await _databaseRef
-          .child('buses')
-          .child(widget.busData['id'])
-          .update({'isOnline': isOnline});
-      print('Bus online status updated to: $isOnline');
-    } catch (e) {
-      print('Error updating online status: $e');
+  @override
+  void dispose() {
+    // Stop timers
+    _stopAutoUpdates();
+
+    // Unsubscribe DB
+    _busSub?.cancel();
+    _busSub = null;
+
+    // Mark offline only if still mounted path decides to end via button.
+    // (Many apps prefer marking offline on explicit "End Tour".)
+    // Here we don't force offline on dispose to avoid false negatives.
+
+    // Release wakelock
+    WakelockPlus.disable();
+
+    super.dispose();
+  }
+
+  void _listenToBusNode() {
+    _busSub = _db.child('buses').child(_busId).onValue.listen((event) {
+      final data = (event.snapshot.value ?? {}) as Map? ?? {};
+      final isOnline = data['isOnline'] == true;
+      final ts = data['lastLocationUpdate'];
+      if (!mounted) return;
+      setState(() {
+        _online = isOnline;
+        if (ts is int) _lastServerTs = ts;
+      });
+    }, onError: (e) {
+      debugPrint('Bus node listen error: $e');
+    });
+  }
+
+  void _startAutoUpdates() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 15), (t) {
+      if (_autoUpdateEnabled && !_isUpdatingLocation && !_isEndingTour) {
+        _updateLocationSilently();
+      }
+    });
+
+    _kickoffTimer?.cancel();
+    _kickoffTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      if (_autoUpdateEnabled && !_isUpdatingLocation) {
+        _updateLocationSilently();
+      }
+    });
+  }
+
+  void _stopAutoUpdates() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _kickoffTimer?.cancel();
+    _kickoffTimer = null;
+  }
+
+  void _toggleAutoUpdate() {
+    setState(() => _autoUpdateEnabled = !_autoUpdateEnabled);
+    if (_autoUpdateEnabled) {
+      _startAutoUpdates();
+    } else {
+      _stopAutoUpdates();
     }
   }
 
-  Future<bool> _checkLocationPermission() async {
-    bool serviceEnabled;
-    LocationPermission permission;
+  Future<void> _setOnline(bool val) async {
+    try {
+      await _db.child('buses').child(_busId).update({'isOnline': val});
+    } catch (e) {
+      debugPrint('setOnline error: $e');
+    }
+  }
 
-    // Check if location services are enabled
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+  Future<bool> _ensureLocationPermission() async {
+    // Check service
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
+      if (!mounted) return false;
       setState(() {
-        _message = 'Location services are disabled. Please enable them in settings.';
-        _isSuccess = false;
+        _toastMsg = 'Location services are disabled. Please enable and retry.';
+        _toastSuccess = false;
       });
       return false;
     }
 
-    // Check location permissions
-    permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
+    // Check permission
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+      if (perm == LocationPermission.denied) {
+        if (!mounted) return false;
         setState(() {
-          _message = 'Location permission denied. Please grant location access.';
-          _isSuccess = false;
+          _toastMsg = 'Location permission denied.';
+          _toastSuccess = false;
         });
         return false;
       }
     }
-
-    if (permission == LocationPermission.deniedForever) {
+    if (perm == LocationPermission.deniedForever) {
+      if (!mounted) return false;
       setState(() {
-        _message = 'Location permissions are permanently denied. Please enable them in app settings.';
-        _isSuccess = false;
+        _toastMsg = 'Location permission permanently denied. Enable in Settings.';
+        _toastSuccess = false;
       });
       return false;
     }
-
     return true;
   }
 
-  Future<void> _updateLocation() async {
-    setState(() {
-      _isUpdatingLocation = true;
-      _message = '';
-    });
-
+  Future<void> _updateLocationSilently() async {
     try {
-      // Check permissions first
-      bool hasPermission = await _checkLocationPermission();
-      if (!hasPermission) {
-        setState(() {
-          _isUpdatingLocation = false;
-        });
-        return;
-      }
+      final ok = await _ensureLocationPermission();
+      if (!ok) return;
 
-      // Get current position
-      Position position = await Geolocator.getCurrentPosition(
+      if (!mounted) return;
+      setState(() => _isUpdatingLocation = true);
+
+      Position pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
-        timeLimit: Duration(seconds: 15),
+      ).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () => Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.medium,
+        ),
       );
 
-      // Format location as "lat, lng"
-      String locationString = '${position.latitude.toStringAsFixed(6)}, ${position.longitude.toStringAsFixed(6)}';
-      
-      // Update location in Firebase
-      await _databaseRef
-          .child('buses')
-          .child(widget.busData['id'])
-          .update({
-        'currentLocation': locationString,
-        'latitude': position.latitude,
-        'longitude': position.longitude,
+      final locStr =
+          '${pos.latitude.toStringAsFixed(6)}, ${pos.longitude.toStringAsFixed(6)}';
+
+      await _db.child('buses').child(_busId).update({
+        'currentLocation': locStr,
+        'latitude': pos.latitude,
+        'longitude': pos.longitude,
         'lastLocationUpdate': ServerValue.timestamp,
       });
 
+      if (!mounted) return;
       setState(() {
-        _currentLocation = locationString;
-        _message = 'Location updated successfully!';
-        _isSuccess = true;
+        _currentLocation = locStr;
+        _lastUpdateClock =
+            TimeOfDay.fromDateTime(DateTime.now()).format(context);
       });
+    } catch (e) {
+      debugPrint('Auto update error: $e');
+    } finally {
+      if (!mounted) return;
+      setState(() => _isUpdatingLocation = false);
+    }
+  }
+
+  Future<void> _updateLocationManually() async {
+    if (!mounted) return;
+    setState(() {
+      _isUpdatingLocation = true;
+      _toastMsg = '';
+    });
+
+    try {
+      final ok = await _ensureLocationPermission();
+      if (!ok) {
+        if (!mounted) return;
+        setState(() => _isUpdatingLocation = false);
+        return;
+      }
+
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 15),
+      );
+
+      final locStr =
+          '${pos.latitude.toStringAsFixed(6)}, ${pos.longitude.toStringAsFixed(6)}';
+
+      await _db.child('buses').child(_busId).update({
+        'currentLocation': locStr,
+        'latitude': pos.latitude,
+        'longitude': pos.longitude,
+        'lastLocationUpdate': ServerValue.timestamp,
+      });
+
+      if (!mounted) return;
+      setState(() {
+        _currentLocation = locStr;
+        _lastUpdateClock =
+            TimeOfDay.fromDateTime(DateTime.now()).format(context);
+        _toastMsg = 'Location updated successfully!';
+        _toastSuccess = true;
+      });
+
+      if (!mounted) return;
       showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-          title: Row(
+        context: context,
+        builder: (_) => AlertDialog(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          title: const Row(
             children: [
-              Icon(Icons.check_circle, color: Colors.green, size: 28),
-              SizedBox(width: 12),
-              Expanded(child: Text("Success", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold))),
+              Icon(Icons.check_circle, color: Colors.green),
+              SizedBox(width: 8),
+              Text('Success'),
             ],
           ),
-          content: Text(_message),
-        );
-      });
-      print('Location updated: $locationString');
-
+          content: Text(_toastMsg),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            )
+          ],
+        ),
+      );
     } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _message = 'Failed to update location: ${e.toString()}';
-        _isSuccess = false;
+        _toastMsg = 'Failed to update location: $e';
+        _toastSuccess = false;
       });
-      print('Location update error: $e');
     } finally {
-      setState(() {
-        _isUpdatingLocation = false;
-      });
+      if (!mounted) return;
+      setState(() => _isUpdatingLocation = false);
     }
   }
 
   Future<void> _endTour() async {
-    // Show confirmation dialog
-    bool confirm = await showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('End Tour'),
-          content: const Text('Are you sure you want to end your tour and log out?'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-              child: const Text('End Tour'),
-            ),
-          ],
-        );
-      },
-    ) ?? false;
+    if (!mounted) return;
+    final confirm = await showDialog<bool>(
+          context: context,
+          builder: (_) => AlertDialog(
+            title: const Text('End Tour'),
+            content: const Text(
+                'Are you sure you want to end your tour and log out?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                style:
+                    ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('End Tour'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
 
     if (!confirm) return;
 
-    setState(() {
-      _isEndingTour = true;
-    });
+    if (!mounted) return;
+    setState(() => _isEndingTour = true);
 
     try {
-      // Update bus status to offline
-      await _databaseRef
-          .child('buses')
-          .child(widget.busData['id'])
-          .update({
+      // Stop auto updates first
+      _stopAutoUpdates();
+
+      // Mark offline + end time
+      await _db.child('buses').child(_busId).update({
         'isOnline': false,
         'tourEndTime': ServerValue.timestamp,
       });
 
-      // Navigate back to login screen
+      if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(
-          builder: (context) => BusDriverLoginScreen(),
-        ),
+        MaterialPageRoute(builder: (_) => const BusDriverLoginScreen()),
         (route) => false,
       );
-
     } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _message = 'Failed to end tour: ${e.toString()}';
-        _isSuccess = false;
+        _toastMsg = 'Failed to end tour: $e';
+        _toastSuccess = false;
         _isEndingTour = false;
       });
-      print('End tour error: $e');
     }
   }
 
-  void _clearMessage() {
-    setState(() {
-      _message = '';
-      _isSuccess = false;
-    });
-  }
-
-  Future<void> _launchWebsite() async {
-    final Uri url = Uri.parse('https://gwtechnologiez.com');
-    if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
-      throw Exception('Could not launch $url');
-    }
+  Future<void> _launchGw() async {
+    final url = Uri.parse('https://gwtechnologiez.com');
+    await launchUrl(url, mode: LaunchMode.externalApplication);
   }
 
   @override
   Widget build(BuildContext context) {
+    final busNumber = (widget.busData['busNumber'] ?? 'N/A').toString();
+    final routeName = (widget.busData['routeName'] ?? 'Unknown').toString();
+
     return Scaffold(
       backgroundColor: Colors.grey[100],
       appBar: AppBar(
-        title: Text('Bus ${widget.busData['busNumber']} Dashboard'),
-        backgroundColor: Colors.blue[600],
+        title: Text('Bus $busNumber Dashboard'),
+        backgroundColor: const Color(0xFFFF0000),
         foregroundColor: Colors.white,
         automaticallyImplyLeading: false,
         elevation: 2,
+        actions: [
+          IconButton(
+            tooltip: _autoUpdateEnabled ? 'Auto-update ON' : 'Auto-update OFF',
+            onPressed: _toggleAutoUpdate,
+            icon: Icon(_autoUpdateEnabled ? Icons.gps_fixed : Icons.gps_off),
+          ),
+        ],
       ),
       body: SafeArea(
         child: Column(
           children: [
             Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(24.0),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(24),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // Bus Info Card
+                    // --- Bus Info Card ---
                     Card(
-                      elevation: 4,
+                      elevation: 3,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(16),
                       ),
                       child: Padding(
-                        padding: const EdgeInsets.all(20.0),
+                        padding: const EdgeInsets.all(18),
                         child: Column(
                           children: [
                             Row(
                               children: [
                                 Container(
-                                  width: 60,
-                                  height: 60,
+                                  width: 56,
+                                  height: 56,
                                   decoration: BoxDecoration(
                                     color: Colors.blue[600],
-                                    borderRadius: BorderRadius.circular(30),
+                                    borderRadius: BorderRadius.circular(28),
                                   ),
-                                  child: const Icon(
-                                    Icons.directions_bus,
-                                    size: 30,
-                                    color: Colors.white,
-                                  ),
+                                  child: const Icon(Icons.directions_bus,
+                                      color: Colors.white, size: 28),
                                 ),
-                                const SizedBox(width: 16),
+                                const SizedBox(width: 14),
                                 Expanded(
                                   child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
                                     children: [
                                       Text(
-                                        'Bus ${widget.busData['busNumber']}',
+                                        'Bus $busNumber',
                                         style: const TextStyle(
-                                          fontSize: 24,
-                                          fontWeight: FontWeight.bold,
+                                          fontSize: 22,
+                                          fontWeight: FontWeight.w700,
                                         ),
                                       ),
                                       Text(
-                                        'Route: ${widget.busData['routeName'] ?? 'Unknown'}',
+                                        'Route: $routeName',
                                         style: TextStyle(
-                                          fontSize: 16,
+                                          fontSize: 15,
                                           color: Colors.grey[600],
                                         ),
                                       ),
@@ -292,11 +426,11 @@ class _BusDriverDashboardState extends State<BusDriverDashboard> {
                                 ),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
-                                    horizontal: 12,
-                                    vertical: 6,
-                                  ),
+                                      horizontal: 12, vertical: 6),
                                   decoration: BoxDecoration(
-                                    color: Colors.green[100],
+                                    color: _online
+                                        ? Colors.green[100]
+                                        : Colors.red[100],
                                     borderRadius: BorderRadius.circular(20),
                                   ),
                                   child: Row(
@@ -305,16 +439,20 @@ class _BusDriverDashboardState extends State<BusDriverDashboard> {
                                       Container(
                                         width: 8,
                                         height: 8,
-                                        decoration: const BoxDecoration(
-                                          color: Colors.green,
+                                        decoration: BoxDecoration(
+                                          color: _online
+                                              ? Colors.green
+                                              : Colors.red,
                                           shape: BoxShape.circle,
                                         ),
                                       ),
                                       const SizedBox(width: 6),
-                                      const Text(
-                                        'Online',
+                                      Text(
+                                        _online ? 'Online' : 'Offline',
                                         style: TextStyle(
-                                          color: Colors.green,
+                                          color: _online
+                                              ? Colors.green[800]
+                                              : Colors.red[800],
                                           fontWeight: FontWeight.bold,
                                         ),
                                       ),
@@ -323,7 +461,7 @@ class _BusDriverDashboardState extends State<BusDriverDashboard> {
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 16),
+                            const SizedBox(height: 14),
                             Container(
                               width: double.infinity,
                               padding: const EdgeInsets.all(12),
@@ -334,22 +472,73 @@ class _BusDriverDashboardState extends State<BusDriverDashboard> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  Text(
-                                    'Current Location:',
-                                    style: TextStyle(
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.grey[600],
-                                    ),
+                                  Row(
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Text(
+                                        'Current Location',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.grey[700],
+                                        ),
+                                      ),
+                                      if (_lastUpdateClock.isNotEmpty)
+                                        Text(
+                                          'Updated: $_lastUpdateClock',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: Colors.grey[600],
+                                          ),
+                                        ),
+                                    ],
                                   ),
-                                  const SizedBox(height: 4),
+                                  const SizedBox(height: 6),
                                   Text(
                                     _currentLocation,
                                     style: const TextStyle(
                                       fontSize: 16,
-                                      fontWeight: FontWeight.w500,
+                                      fontWeight: FontWeight.w600,
                                     ),
                                   ),
+                                  const SizedBox(height: 8),
+                                  Row(
+                                    children: [
+                                      Container(
+                                        width: 8,
+                                        height: 8,
+                                        decoration: BoxDecoration(
+                                          color: _isUpdatingLocation
+                                              ? Colors.orange
+                                              : Colors.blue,
+                                          shape: BoxShape.circle,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        _autoUpdateEnabled
+                                            ? (_isUpdatingLocation
+                                                ? 'Updating...'
+                                                : 'Auto-updating every 15s')
+                                            : 'Auto-update OFF',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.blue[700],
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  if (_lastServerTs != null) ...[
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      'Server TS: $_lastServerTs',
+                                      style: TextStyle(
+                                          fontSize: 11,
+                                          color: Colors.grey[600]),
+                                    ),
+                                  ]
                                 ],
                               ),
                             ),
@@ -358,162 +547,148 @@ class _BusDriverDashboardState extends State<BusDriverDashboard> {
                       ),
                     ),
 
-                    const SizedBox(height: 30),
+                    const SizedBox(height: 24),
 
-                    // Update Location Button
+                    // --- Manual Update ---
                     SizedBox(
-                      height: 60,
+                      height: 56,
                       child: ElevatedButton(
-                        onPressed: _isUpdatingLocation ? null : _updateLocation,
+                        onPressed: _isUpdatingLocation
+                            ? null
+                            : _updateLocationManually,
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.green[600],
                           foregroundColor: Colors.white,
                           shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          elevation: 3,
+                              borderRadius: BorderRadius.circular(14)),
+                          elevation: 2,
                         ),
                         child: _isUpdatingLocation
                             ? const Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
                                   SizedBox(
-                                    width: 24,
-                                    height: 24,
+                                    width: 22,
+                                    height: 22,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                          Colors.white),
                                     ),
                                   ),
                                   SizedBox(width: 12),
-                                  Text(
-                                    'Updating Location...',
-                                    style: TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
+                                  Text('Updating Location...'),
                                 ],
                               )
                             : const Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
-                                  Icon(Icons.location_on, size: 24),
+                                  Icon(Icons.my_location, size: 22),
                                   SizedBox(width: 8),
                                   Text(
-                                    'Update Location',
-                                    style: TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                    ),
+                                    'Update Location Now',
+                                    style:
+                                        TextStyle(fontWeight: FontWeight.bold),
                                   ),
                                 ],
                               ),
                       ),
                     ),
 
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 16),
 
-                    // End Tour Button
+                    // --- End Tour ---
                     SizedBox(
-                      height: 60,
+                      height: 56,
                       child: ElevatedButton(
                         onPressed: _isEndingTour ? null : _endTour,
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.red[600],
                           foregroundColor: Colors.white,
                           shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          elevation: 3,
+                              borderRadius: BorderRadius.circular(14)),
+                          elevation: 2,
                         ),
                         child: _isEndingTour
                             ? const Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
                                   SizedBox(
-                                    width: 24,
-                                    height: 24,
+                                    width: 22,
+                                    height: 22,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                          Colors.white),
                                     ),
                                   ),
                                   SizedBox(width: 12),
-                                  Text(
-                                    'Ending Tour...',
-                                    style: TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
+                                  Text('Ending Tour...'),
                                 ],
                               )
                             : const Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
-                                  Icon(Icons.logout, size: 24),
+                                  Icon(Icons.logout, size: 22),
                                   SizedBox(width: 8),
                                   Text(
                                     'End Tour & Logout',
-                                    style: TextStyle(
-                                      fontSize: 18,
-                                      fontWeight: FontWeight.bold,
-                                    ),
+                                    style:
+                                        TextStyle(fontWeight: FontWeight.bold),
                                   ),
                                 ],
                               ),
                       ),
                     ),
 
-                    const SizedBox(height: 30),
+                    const SizedBox(height: 8),
 
-                    // Footer Info
-                    Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: Colors.blue[50],
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.blue[200]!),
-                      ),
-                      child: Column(
-                        children: [
-                          const Icon(
-                            Icons.info_outline,
-                            color: Colors.blue,
-                            size: 24,
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Keep your location updated regularly for accurate passenger tracking',
-                            style: TextStyle(
-                              color: Colors.blue[800],
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
+                    if (_toastMsg.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Row(
+                          children: [
+                            Icon(
+                              _toastSuccess
+                                  ? Icons.check_circle
+                                  : Icons.error_outline,
+                              size: 18,
+                              color:
+                                  _toastSuccess ? Colors.green : Colors.redAccent,
                             ),
-                            textAlign: TextAlign.center,
-                          ),
-                        ],
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                _toastMsg,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: _toastSuccess
+                                      ? Colors.green[700]
+                                      : Colors.red[700],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
                   ],
                 ),
               ),
             ),
-            
-            // Footer Section
+
+            // --- Footer ---
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(20),
-                  topRight: Radius.circular(20),
+                  topLeft: Radius.circular(18),
+                  topRight: Radius.circular(18),
                 ),
                 boxShadow: [
                   BoxShadow(
-                    color: Colors.grey.withOpacity(0.2),
+                    color: Colors.black.withOpacity(0.06),
                     spreadRadius: 2,
                     blurRadius: 8,
                     offset: const Offset(0, -2),
@@ -523,23 +698,17 @@ class _BusDriverDashboardState extends State<BusDriverDashboard> {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Text(
-                    'Powered by ',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.grey[600],
-                      fontWeight: FontWeight.w400,
-                    ),
-                  ),
+                  Text('Powered by ',
+                      style: TextStyle(fontSize: 10, color: Colors.grey[700])),
                   GestureDetector(
-                    onTap: _launchWebsite,
+                    onTap: _launchGw,
                     child: Text(
-                      'GW Technology',
+                      'GW Technology (Pvt) Ltd',
                       style: TextStyle(
-                        fontSize: 14,
-                        color: Colors.blue[600],
-                        fontWeight: FontWeight.bold,
+                        fontSize: 10,
+                        color: Colors.blue[700],
                         decoration: TextDecoration.underline,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
                   ),
